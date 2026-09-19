@@ -1,17 +1,13 @@
 import express from 'express';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI } from '@google/genai';
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 // Generous body limit for high-resolution document images and scanned PDFs
 app.use(express.json({ limit: '35mb' }));
@@ -19,9 +15,11 @@ app.use(express.urlencoded({ extended: true, limit: '35mb' }));
 
 // Lazy init for Gemini API client
 let aiClient: GoogleGenAI | null = null;
+
 function getGenAI(): GoogleGenAI {
   if (!aiClient) {
     const apiKey = process.env.GEMINI_API_KEY;
+
     aiClient = new GoogleGenAI({
       apiKey: apiKey || '',
       httpOptions: {
@@ -31,6 +29,7 @@ function getGenAI(): GoogleGenAI {
       },
     });
   }
+
   return aiClient;
 }
 
@@ -38,70 +37,126 @@ function getGenAI(): GoogleGenAI {
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    hasApiKey: Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'),
+    hasApiKey: Boolean(
+      process.env.GEMINI_API_KEY &&
+      process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'
+    ),
     timestamp: new Date().toISOString(),
   });
 });
 
 // Helper to extract clean base64 data & mimeType
-function parseDataUrl(dataUrl: string, fallbackMime = 'image/png') {
-  if (!dataUrl) return { mimeType: fallbackMime, base64: '' };
+function parseDataUrl(
+  dataUrl: string,
+  fallbackMime = 'image/png'
+) {
+  if (!dataUrl) {
+    return {
+      mimeType: fallbackMime,
+      base64: '',
+    };
+  }
+
   if (dataUrl.startsWith('data:')) {
     const [header, base64] = dataUrl.split(',', 2);
+
     const mimeMatch = header.match(/data:([^;]+)/);
+
     return {
       mimeType: mimeMatch ? mimeMatch[1] : fallbackMime,
       base64: base64 || '',
     };
   }
-  return { mimeType: fallbackMime, base64: dataUrl };
+
+  return {
+    mimeType: fallbackMime,
+    base64: dataUrl,
+  };
 }
 
-// Helper: robust JSON parse from Gemini text (handles code fences if any)
+// Helper: robust JSON parse from Gemini text
 function parseJsonFromText(rawText: string) {
   try {
     let clean = rawText.trim();
+
     if (clean.startsWith('```json')) {
-      clean = clean.replace(/^```json\s*/i, '').replace(/```\s*$/i, '');
+      clean = clean
+        .replace(/^```json\s*/i, '')
+        .replace(/```\s*$/i, '');
     } else if (clean.startsWith('```')) {
-      clean = clean.replace(/^```\s*/, '').replace(/```\s*$/i, '');
+      clean = clean
+        .replace(/^```\s*/, '')
+        .replace(/```\s*$/i, '');
     }
+
     return JSON.parse(clean);
   } catch (err) {
-    // Try to find first { or [ and last } or ]
     const firstBrace = rawText.indexOf('{');
     const lastBrace = rawText.lastIndexOf('}');
-    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+
+    if (
+      firstBrace !== -1 &&
+      lastBrace !== -1 &&
+      lastBrace > firstBrace
+    ) {
       const sub = rawText.substring(firstBrace, lastBrace + 1);
       return JSON.parse(sub);
     }
-    throw new Error(`Failed to parse structured JSON from model output: ${err instanceof Error ? err.message : String(err)}`);
+
+    throw new Error(
+      `Failed to parse structured JSON from model output: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
   }
 }
 
+// ============================================================
 // STAGE 1: MULTIMODAL EXTRACTION
+// ============================================================
+
 app.post('/api/extract', async (req, res) => {
   const startTime = Date.now();
+
   try {
-    const { fileDataUrl, mimeType, fileName } = req.body;
+    const {
+      fileDataUrl,
+      mimeType,
+      fileName,
+    } = req.body;
+
     if (!fileDataUrl) {
-      return res.status(400).json({ error: 'fileDataUrl is required' });
+      return res.status(400).json({
+        error: 'fileDataUrl is required',
+      });
     }
 
-    const { mimeType: parsedMime, base64 } = parseDataUrl(fileDataUrl, mimeType || 'image/png');
-    
-    // Check if real API key is configured
+    const {
+      mimeType: parsedMime,
+      base64,
+    } = parseDataUrl(
+      fileDataUrl,
+      mimeType || 'image/png'
+    );
+
     const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+
+    if (
+      !apiKey ||
+      apiKey === 'MY_GEMINI_API_KEY'
+    ) {
       return res.status(500).json({
-        error: 'GEMINI_API_KEY is not configured in environment variables. Please provide an API key in Settings > Secrets.',
+        error:
+          'GEMINI_API_KEY is not configured in environment variables. Please provide an API key in Settings > Secrets.',
       });
     }
 
     const ai = getGenAI();
 
     const systemInstruction = `You are a specialized Multimodal Document Information Extraction AI.
+
 Your objective is to thoroughly extract all fields and values visible in this application form into structured JSON.
+
 Look for:
 - Full Applicant Name, Surnames, Titles
 - Identification numbers (SSN, ID numbers, License numbers, Passport numbers, CWID, etc.)
@@ -114,16 +169,21 @@ Look for:
 - Checkboxes and selections
 
 For every field provide:
-- fieldKey: lowercase snake_case identifier (e.g., 'full_name', 'dob', 'license_num')
-- label: Human readable label (e.g., 'Full Legal Name', 'Medical License #')
+- fieldKey: lowercase snake_case identifier
+- label: Human readable label
 - category: one of 'personal' | 'contact' | 'identification' | 'education' | 'employment' | 'financial' | 'declaration' | 'other'
 - extractedValue: string or null if blank
 - confidence: integer from 1 to 100
-- rawLocationHint: short description of where it appears on the document (e.g., 'Section 1 Box 2', 'Header row')
+- rawLocationHint: short description of where it appears on the document
 
-Be thorough. Extract raw text as visible. Do NOT perform verification or fact-checking yet (that is handled in Stage 2).`;
+Be thorough.
+Extract raw text as visible.
+Do NOT perform verification or fact-checking yet.`;
 
-    const promptText = `Extract all visible fields from this application form document. Return a JSON object with this exact structure:
+    const promptText = `Extract all visible fields from this application form document.
+
+Return a JSON object with this exact structure:
+
 {
   "documentTypeDetected": string,
   "extractionSummary": string,
@@ -143,106 +203,170 @@ Be thorough. Extract raw text as visible. Do NOT perform verification or fact-ch
       parts: [
         {
           inlineData: {
-            mimeType: parsedMime === 'application/pdf' ? 'application/pdf' : parsedMime,
+            mimeType:
+              parsedMime === 'application/pdf'
+                ? 'application/pdf'
+                : parsedMime,
             data: base64,
           },
         },
-        { text: promptText },
+        {
+          text: promptText,
+        },
       ],
     };
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents,
-      config: {
-        systemInstruction,
-        responseMimeType: 'application/json',
-      },
-    });
+    const response =
+      await ai.models.generateContent({
+        model: 'gemini-3.8-flash',
+        contents,
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+        },
+      });
 
-    const parsed = parseJsonFromText(response.text || '{}');
-    const processingTimeMs = Date.now() - startTime;
+    const parsed = parseJsonFromText(
+      response.text || '{}'
+    );
+
+    const processingTimeMs =
+      Date.now() - startTime;
 
     res.json({
       fields: parsed.fields || [],
-      documentTypeDetected: parsed.documentTypeDetected || 'Application Form',
-      extractionSummary: parsed.extractionSummary || 'Extraction completed',
+      documentTypeDetected:
+        parsed.documentTypeDetected ||
+        'Application Form',
+      extractionSummary:
+        parsed.extractionSummary ||
+        'Extraction completed',
       processingTimeMs,
     });
   } catch (error: any) {
-    console.error('Extraction error:', error);
+    console.error(
+      'Extraction error:',
+      error
+    );
+
     res.status(500).json({
-      error: error?.message || 'Failed to extract document information',
+      error:
+        error?.message ||
+        'Failed to extract document information',
       details: String(error),
     });
   }
 });
 
+// ============================================================
 // STAGE 2: ADVERSARIAL SELF-VERIFICATION
+// ============================================================
+
 app.post('/api/verify', async (req, res) => {
   const startTime = Date.now();
+
   try {
-    const { fileDataUrl, mimeType, stage1Fields } = req.body;
-    if (!fileDataUrl || !stage1Fields || !Array.isArray(stage1Fields)) {
-      return res.status(400).json({ error: 'fileDataUrl and stage1Fields array are required' });
+    const {
+      fileDataUrl,
+      mimeType,
+      stage1Fields,
+    } = req.body;
+
+    if (
+      !fileDataUrl ||
+      !stage1Fields ||
+      !Array.isArray(stage1Fields)
+    ) {
+      return res.status(400).json({
+        error:
+          'fileDataUrl and stage1Fields array are required',
+      });
     }
 
-    const { mimeType: parsedMime, base64 } = parseDataUrl(fileDataUrl, mimeType || 'image/png');
+    const {
+      mimeType: parsedMime,
+      base64,
+    } = parseDataUrl(
+      fileDataUrl,
+      mimeType || 'image/png'
+    );
 
     const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+
+    if (
+      !apiKey ||
+      apiKey === 'MY_GEMINI_API_KEY'
+    ) {
       return res.status(500).json({
-        error: 'GEMINI_API_KEY is not configured in environment variables.',
+        error:
+          'GEMINI_API_KEY is not configured in environment variables.',
       });
     }
 
     const ai = getGenAI();
 
     const systemInstruction = `You are the Lead Verification Auditor in an AI reliability & self-checking pipeline.
+
 You have received:
 1. The ORIGINAL source document (image or PDF).
-2. The initial Stage 1 extraction fields: ${JSON.stringify(stage1Fields)}.
+2. The initial Stage 1 extraction fields.
 
-YOUR SOLE MISSION: Rigorously audit, cross-check, and verify each extracted field against the GROUND TRUTH visible in the original document.
+YOUR SOLE MISSION:
+Rigorously audit, cross-check, and verify each extracted field against the GROUND TRUTH visible in the original document.
 
 STRICT AUDIT GUIDELINES:
-1. DO NOT ASSUME OR HALLUCINATE: Only verify facts that are explicitly, visually supported by the source document.
-2. DETECT OCR MISREADS: Look for character confusions:
-   - '0' (zero) vs 'O' (letter O)
-   - '1' vs 'I' vs 'l'
-   - '5' vs 'S'
-   - '8' vs 'B'
-   - '2' vs 'Z'
-   - Transposed numbers, misspelled surnames, wrong middle initials (e.g. 'M.' misread as 'N.').
+
+1. DO NOT ASSUME OR HALLUCINATE:
+Only verify facts that are explicitly, visually supported by the source document.
+
+2. DETECT OCR MISREADS:
+Look for character confusions:
+- '0' (zero) vs 'O' (letter O)
+- '1' vs 'I' vs 'l'
+- '5' vs 'S'
+- '8' vs 'B'
+- '2' vs 'Z'
+- Transposed numbers
+- Misspelled surnames
+- Wrong middle initials
+
 3. DETECT INTERNAL CONTRADICTIONS:
-   - Date of birth vs declared age (e.g., DOB 2007 is age 18, but form claims age 24).
-   - Conflicting monetary figures (e.g., reported AGI on line 14 differs from parent 1040/W-2 attached on line 22).
-   - Chronological paradoxes (e.g., claimed 18 years post-MD practice, but medical degree graduation was only 2012).
-   - Conflicting addresses, phone numbers, or dates within the form.
+- Date of birth vs declared age
+- Conflicting monetary figures
+- Chronological paradoxes
+- Conflicting addresses, phone numbers, or dates
+
 4. DETECT OMISSIONS / MISSING FIELDS:
-   - Required fields that are left blank (e.g., missing signature date, unfilled ID boxes).
-   - If Stage 1 extracted a value that is actually blank in the document, mark it as errorType: 'hallucination' or 'omission'.
+Required fields that are left blank.
+
 5. DETECT AMBIGUITIES & STRIKETHROUGHS:
-   - Handwritten overwrites, crossed-out text (e.g., 'Apt 48' crossed out with 'Apt 4B' written next to it).
-6. FOR EVERY FIELD, YOU MUST PROVIDE:
-   - status: EXACTLY one of: 'Verified' | 'Needs Review' | 'Missing' | 'Contradiction Detected'
-   - errorDetected: boolean (true if misread, contradictory, missing, or ambiguous)
-   - errorType: 'none' | 'ocr_misread' | 'contradiction' | 'omission' | 'hallucination' | 'format_discrepancy' | 'ambiguity'
-   - evidence: exact text excerpt, visual quotation, or visible observation from the source document
-   - correctedValue: the true value supported by the source document (or null if unresolvable or already correct)
-   - verificationNotes: concise explanation of what you checked, why it passed or why it was flagged
-   - confidence: 0 to 100
+Handwritten overwrites and crossed-out text.
+
+6. FOR EVERY FIELD PROVIDE:
+- status
+- errorDetected
+- errorType
+- evidence
+- correctedValue
+- verificationNotes
+- confidence
+
 7. FINAL SUMMARY:
-   - verificationScore: percentage of fields cleanly verified (0 to 100). (Note: overall verification score based on verified fields, not proof of absolute authenticity).
-   - ocrErrorsCaught: count of OCR misreads detected
-   - contradictionsCaught: count of internal contradictions detected
-   - omissionsCaught: count of missing fields detected
-   - pipelineSummary: clear 2-3 sentence executive audit verdict explaining the pipeline's self-correction performance.
-   - contradictionDetails: array of string explanations for every contradiction found.
-   - recommendation: 'VERIFIED_CLEAR' | 'ACCEPTABLE_WITH_FLAGS' | 'ACTION_REQUIRED_CONTRADICTIONS' | 'REJECT_UNREADABLE'`;
+- verificationScore
+- ocrErrorsCaught
+- contradictionsCaught
+- omissionsCaught
+- pipelineSummary
+- contradictionDetails
+- recommendation`;
 
     const promptText = `Audit the Stage 1 extraction against the provided document.
+
+Stage 1 fields:
+${JSON.stringify(stage1Fields)}
+
 Output strict JSON with this exact schema:
+
 {
   "fields": [
     {
@@ -277,45 +401,114 @@ Output strict JSON with this exact schema:
       parts: [
         {
           inlineData: {
-            mimeType: parsedMime === 'application/pdf' ? 'application/pdf' : parsedMime,
+            mimeType:
+              parsedMime === 'application/pdf'
+                ? 'application/pdf'
+                : parsedMime,
             data: base64,
           },
         },
-        { text: promptText },
+        {
+          text: promptText,
+        },
       ],
     };
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents,
-      config: {
-        systemInstruction,
-        responseMimeType: 'application/json',
-      },
-    });
+    const response =
+      await ai.models.generateContent({
+        model: 'gemini-3.8-flash',
+        contents,
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+        },
+      });
 
-    const parsed = parseJsonFromText(response.text || '{}');
+    const parsed = parseJsonFromText(
+      response.text || '{}'
+    );
+
     const fields = parsed.fields || [];
 
-    // Calculate/validate counts dynamically to guarantee mathematical consistency
     const totalFields = fields.length;
-    const verifiedCount = fields.filter((f: any) => f.status === 'Verified').length;
-    const needsReviewCount = fields.filter((f: any) => f.status === 'Needs Review').length;
-    const missingCount = fields.filter((f: any) => f.status === 'Missing').length;
-    const contradictionCount = fields.filter((f: any) => f.status === 'Contradiction Detected').length;
-    const ocrErrorsCaught = fields.filter((f: any) => f.errorType === 'ocr_misread').length;
-    const contradictionsCaught = fields.filter((f: any) => f.errorType === 'contradiction' || f.status === 'Contradiction Detected').length;
-    const omissionsCaught = fields.filter((f: any) => f.errorType === 'omission' || f.status === 'Missing').length;
-    const verificationScore = totalFields > 0 ? Math.round((verifiedCount / totalFields) * 100) : 0;
 
-    let recommendation = parsed.recommendation;
+    const verifiedCount =
+      fields.filter(
+        (f: any) =>
+          f.status === 'Verified'
+      ).length;
+
+    const needsReviewCount =
+      fields.filter(
+        (f: any) =>
+          f.status === 'Needs Review'
+      ).length;
+
+    const missingCount =
+      fields.filter(
+        (f: any) =>
+          f.status === 'Missing'
+      ).length;
+
+    const contradictionCount =
+      fields.filter(
+        (f: any) =>
+          f.status ===
+          'Contradiction Detected'
+      ).length;
+
+    const ocrErrorsCaught =
+      fields.filter(
+        (f: any) =>
+          f.errorType === 'ocr_misread'
+      ).length;
+
+    const contradictionsCaught =
+      fields.filter(
+        (f: any) =>
+          f.errorType ===
+            'contradiction' ||
+          f.status ===
+            'Contradiction Detected'
+      ).length;
+
+    const omissionsCaught =
+      fields.filter(
+        (f: any) =>
+          f.errorType === 'omission' ||
+          f.status === 'Missing'
+      ).length;
+
+    const verificationScore =
+      totalFields > 0
+        ? Math.round(
+            (verifiedCount /
+              totalFields) *
+              100
+          )
+        : 0;
+
+    let recommendation =
+      parsed.recommendation;
+
     if (!recommendation) {
-      if (contradictionCount > 0) recommendation = 'ACTION_REQUIRED_CONTRADICTIONS';
-      else if (needsReviewCount > 0 || missingCount > 0) recommendation = 'ACCEPTABLE_WITH_FLAGS';
-      else recommendation = 'VERIFIED_CLEAR';
+      if (contradictionCount > 0) {
+        recommendation =
+          'ACTION_REQUIRED_CONTRADICTIONS';
+      } else if (
+        needsReviewCount > 0 ||
+        missingCount > 0
+      ) {
+        recommendation =
+          'ACCEPTABLE_WITH_FLAGS';
+      } else {
+        recommendation =
+          'VERIFIED_CLEAR';
+      }
     }
 
-    const processingTimeMs = Date.now() - startTime;
+    const processingTimeMs =
+      Date.now() - startTime;
 
     res.json({
       fields,
@@ -328,78 +521,155 @@ Output strict JSON with this exact schema:
       contradictionsCaught,
       omissionsCaught,
       verificationScore,
-      pipelineSummary: parsed.pipelineSummary || `Verification completed: ${verifiedCount} of ${totalFields} fields verified (${verificationScore}% consistency score).`,
-      contradictionDetails: parsed.contradictionDetails || [],
+      pipelineSummary:
+        parsed.pipelineSummary ||
+        `Verification completed: ${verifiedCount} of ${totalFields} fields verified (${verificationScore}% consistency score).`,
+      contradictionDetails:
+        parsed.contradictionDetails ||
+        [],
       recommendation,
       processingTimeMs,
     });
   } catch (error: any) {
-    console.error('Verification error:', error);
+    console.error(
+      'Verification error:',
+      error
+    );
+
     res.status(500).json({
-      error: error?.message || 'Failed to verify document fields',
+      error:
+        error?.message ||
+        'Failed to verify document fields',
       details: String(error),
     });
   }
 });
 
+// ============================================================
 // FULL PIPELINE ROUTE: STAGE 1 + STAGE 2
-app.post('/api/run-pipeline', async (req, res) => {
-  const pipelineStartTime = Date.now();
-  try {
-    const { fileDataUrl, mimeType, fileName } = req.body;
-    if (!fileDataUrl) {
-      return res.status(400).json({ error: 'fileDataUrl is required' });
+// ============================================================
+
+app.post(
+  '/api/run-pipeline',
+  async (req, res) => {
+    const pipelineStartTime =
+      Date.now();
+
+    try {
+      const {
+        fileDataUrl,
+        mimeType,
+        fileName,
+      } = req.body;
+
+      if (!fileDataUrl) {
+        return res.status(400).json({
+          error:
+            'fileDataUrl is required',
+        });
+      }
+
+      const {
+        mimeType: parsedMime,
+        base64,
+      } = parseDataUrl(
+        fileDataUrl,
+        mimeType || 'image/png'
+      );
+
+      const ai = getGenAI();
+
+      // ========================================================
+      // 1. STAGE 1: EXTRACTION
+      // ========================================================
+
+      const stage1Start =
+        Date.now();
+
+      const extractionResponse =
+        await ai.models.generateContent({
+          model: 'gemini-3.8-flash',
+
+          contents: {
+            parts: [
+              {
+                inlineData: {
+                  mimeType: parsedMime,
+                  data: base64,
+                },
+              },
+              {
+                text: `Extract all fields from this document into JSON:
+
+{
+  "documentTypeDetected": string,
+  "extractionSummary": string,
+  "fields": [
+    {
+      "fieldKey": string,
+      "label": string,
+      "category": "personal" | "contact" | "identification" | "education" | "employment" | "financial" | "declaration" | "other",
+      "extractedValue": string or null,
+      "confidence": number,
+      "rawLocationHint": string
     }
-
-    const { mimeType: parsedMime, base64 } = parseDataUrl(fileDataUrl, mimeType || 'image/png');
-    const ai = getGenAI();
-
-    // 1. Stage 1: Extraction
-    const stage1Start = Date.now();
-    const extractionResponse = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: {
-        parts: [
-          { inlineData: { mimeType: parsedMime, data: base64 } },
-          {
-            text: `Extract all fields from this document into JSON:
-            {
-              "documentTypeDetected": string,
-              "extractionSummary": string,
-              "fields": [
-                {
-                  "fieldKey": string,
-                  "label": string,
-                  "category": "personal" | "contact" | "identification" | "education" | "employment" | "financial" | "declaration" | "other",
-                  "extractedValue": string or null,
-                  "confidence": number,
-                  "rawLocationHint": string
-                }
-              ]
-            }`,
+  ]
+}`,
+              },
+            ],
           },
-        ],
-      },
-      config: {
-        responseMimeType: 'application/json',
-      },
-    });
 
-    const stage1Parsed = parseJsonFromText(extractionResponse.text || '{}');
-    const stage1Fields = stage1Parsed.fields || [];
-    const stage1TimeMs = Date.now() - stage1Start;
+          config: {
+            responseMimeType:
+              'application/json',
+          },
+        });
 
-    // 2. Stage 2: Self-Verification
-    const stage2Start = Date.now();
-    const verificationResponse = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: {
-        parts: [
-          { inlineData: { mimeType: parsedMime, data: base64 } },
-          {
-            text: `Audit the Stage 1 extraction fields: ${JSON.stringify(stage1Fields)}.
-Check each against the ground-truth document for OCR mistakes, contradictions, and missing items.
+      const stage1Parsed =
+        parseJsonFromText(
+          extractionResponse.text ||
+            '{}'
+        );
+
+      const stage1Fields =
+        stage1Parsed.fields || [];
+
+      const stage1TimeMs =
+        Date.now() -
+        stage1Start;
+
+      // ========================================================
+      // 2. STAGE 2: SELF-VERIFICATION
+      // ========================================================
+
+      const stage2Start =
+        Date.now();
+
+      const verificationResponse =
+        await ai.models.generateContent({
+          model: 'gemini-3.8-flash',
+
+          contents: {
+            parts: [
+              {
+                inlineData: {
+                  mimeType: parsedMime,
+                  data: base64,
+                },
+              },
+              {
+                text: `Audit the Stage 1 extraction fields:
+
+${JSON.stringify(stage1Fields)}
+
+Check each field against the ground-truth document for:
+- OCR mistakes
+- Contradictions
+- Missing items
+- Ambiguities
+
 Output JSON:
+
 {
   "fields": [
     {
@@ -420,93 +690,264 @@ Output JSON:
   "contradictionDetails": [string],
   "recommendation": "VERIFIED_CLEAR" | "ACCEPTABLE_WITH_FLAGS" | "ACTION_REQUIRED_CONTRADICTIONS" | "REJECT_UNREADABLE"
 }`,
+              },
+            ],
           },
-        ],
-      },
-      config: {
-        responseMimeType: 'application/json',
-      },
-    });
 
-    const stage2Parsed = parseJsonFromText(verificationResponse.text || '{}');
-    const stage2Fields = stage2Parsed.fields || [];
-    const stage2TimeMs = Date.now() - stage2Start;
+          config: {
+            responseMimeType:
+              'application/json',
+          },
+        });
 
-    const totalFields = stage2Fields.length;
-    const verifiedCount = stage2Fields.filter((f: any) => f.status === 'Verified').length;
-    const needsReviewCount = stage2Fields.filter((f: any) => f.status === 'Needs Review').length;
-    const missingCount = stage2Fields.filter((f: any) => f.status === 'Missing').length;
-    const contradictionCount = stage2Fields.filter((f: any) => f.status === 'Contradiction Detected').length;
-    const ocrErrorsCaught = stage2Fields.filter((f: any) => f.errorType === 'ocr_misread').length;
-    const contradictionsCaught = stage2Fields.filter((f: any) => f.errorType === 'contradiction' || f.status === 'Contradiction Detected').length;
-    const omissionsCaught = stage2Fields.filter((f: any) => f.errorType === 'omission' || f.status === 'Missing').length;
-    const verificationScore = totalFields > 0 ? Math.round((verifiedCount / totalFields) * 100) : 0;
+      const stage2Parsed =
+        parseJsonFromText(
+          verificationResponse.text ||
+            '{}'
+        );
 
-    let recommendation = stage2Parsed.recommendation;
-    if (!recommendation) {
-      if (contradictionCount > 0) recommendation = 'ACTION_REQUIRED_CONTRADICTIONS';
-      else if (needsReviewCount > 0 || missingCount > 0) recommendation = 'ACCEPTABLE_WITH_FLAGS';
-      else recommendation = 'VERIFIED_CLEAR';
+      const stage2Fields =
+        stage2Parsed.fields || [];
+
+      const stage2TimeMs =
+        Date.now() -
+        stage2Start;
+
+      // ========================================================
+      // CALCULATE RESULTS
+      // ========================================================
+
+      const totalFields =
+        stage2Fields.length;
+
+      const verifiedCount =
+        stage2Fields.filter(
+          (f: any) =>
+            f.status === 'Verified'
+        ).length;
+
+      const needsReviewCount =
+        stage2Fields.filter(
+          (f: any) =>
+            f.status ===
+            'Needs Review'
+        ).length;
+
+      const missingCount =
+        stage2Fields.filter(
+          (f: any) =>
+            f.status === 'Missing'
+        ).length;
+
+      const contradictionCount =
+        stage2Fields.filter(
+          (f: any) =>
+            f.status ===
+            'Contradiction Detected'
+        ).length;
+
+      const ocrErrorsCaught =
+        stage2Fields.filter(
+          (f: any) =>
+            f.errorType ===
+            'ocr_misread'
+        ).length;
+
+      const contradictionsCaught =
+        stage2Fields.filter(
+          (f: any) =>
+            f.errorType ===
+              'contradiction' ||
+            f.status ===
+              'Contradiction Detected'
+        ).length;
+
+      const omissionsCaught =
+        stage2Fields.filter(
+          (f: any) =>
+            f.errorType ===
+              'omission' ||
+            f.status ===
+              'Missing'
+        ).length;
+
+      const verificationScore =
+        totalFields > 0
+          ? Math.round(
+              (verifiedCount /
+                totalFields) *
+                100
+            )
+          : 0;
+
+      let recommendation =
+        stage2Parsed.recommendation;
+
+      if (!recommendation) {
+        if (
+          contradictionCount >
+          0
+        ) {
+          recommendation =
+            'ACTION_REQUIRED_CONTRADICTIONS';
+        } else if (
+          needsReviewCount > 0 ||
+          missingCount > 0
+        ) {
+          recommendation =
+            'ACCEPTABLE_WITH_FLAGS';
+        } else {
+          recommendation =
+            'VERIFIED_CLEAR';
+        }
+      }
+
+      // ========================================================
+      // FINAL RESPONSE
+      // ========================================================
+
+      res.json({
+        documentId:
+          'doc-' +
+          Date.now(),
+
+        documentName:
+          fileName ||
+          'Uploaded Document',
+
+        mimeType:
+          parsedMime,
+
+        timestamp:
+          new Date().toISOString(),
+
+        fileDataUrl,
+
+        stage1: {
+          fields:
+            stage1Fields,
+
+          processingTimeMs:
+            stage1TimeMs,
+
+          documentTypeDetected:
+            stage1Parsed.documentTypeDetected,
+
+          extractionSummary:
+            stage1Parsed.extractionSummary,
+        },
+
+        stage2: {
+          fields:
+            stage2Fields,
+
+          processingTimeMs:
+            stage2TimeMs,
+
+          verificationScore,
+
+          totalFields,
+
+          verifiedCount,
+
+          needsReviewCount,
+
+          missingCount,
+
+          contradictionCount,
+
+          ocrErrorsCaught,
+
+          contradictionsCaught,
+
+          omissionsCaught,
+
+          pipelineSummary:
+            stage2Parsed.pipelineSummary,
+
+          contradictionDetails:
+            stage2Parsed.contradictionDetails ||
+            [],
+
+          recommendation,
+        },
+
+        totalDurationMs:
+          Date.now() -
+          pipelineStartTime,
+      });
+    } catch (error: any) {
+      console.error(
+        'Pipeline error:',
+        error
+      );
+
+      res.status(500).json({
+        error:
+          error?.message ||
+          'Verification pipeline execution failed',
+
+        details:
+          String(error),
+      });
     }
-
-    res.json({
-      documentId: 'doc-' + Date.now(),
-      documentName: fileName || 'Uploaded Document',
-      mimeType: parsedMime,
-      timestamp: new Date().toISOString(),
-      fileDataUrl,
-      stage1: {
-        fields: stage1Fields,
-        processingTimeMs: stage1TimeMs,
-        documentTypeDetected: stage1Parsed.documentTypeDetected,
-        extractionSummary: stage1Parsed.extractionSummary,
-      },
-      stage2: {
-        fields: stage2Fields,
-        processingTimeMs: stage2TimeMs,
-        verificationScore,
-        totalFields,
-        verifiedCount,
-        needsReviewCount,
-        missingCount,
-        contradictionCount,
-        ocrErrorsCaught,
-        contradictionsCaught,
-        omissionsCaught,
-        pipelineSummary: stage2Parsed.pipelineSummary,
-        contradictionDetails: stage2Parsed.contradictionDetails || [],
-        recommendation,
-      },
-      totalDurationMs: Date.now() - pipelineStartTime,
-    });
-  } catch (error: any) {
-    console.error('Pipeline error:', error);
-    res.status(500).json({
-      error: error?.message || 'Verification pipeline execution failed',
-      details: String(error),
-    });
   }
-});
+);
 
-// Vite middleware or static serving
+// ============================================================
+// VITE MIDDLEWARE / STATIC SERVING
+// ============================================================
+
 async function startServer() {
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
+  if (
+    process.env.NODE_ENV !==
+    'production'
+  ) {
+    const vite =
+      await createViteServer({
+        server: {
+          middlewareMode: true,
+        },
+
+        appType: 'spa',
+      });
+
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
+    const distPath =
+      path.join(
+        process.cwd(),
+        'dist'
+      );
+
+    app.use(
+      express.static(
+        distPath
+      )
+    );
+
+    app.get(
+      '*',
+      (req, res) => {
+        res.sendFile(
+          path.join(
+            distPath,
+            'index.html'
+          )
+        );
+      }
+    );
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[FormVerify] Server running on http://0.0.0.0:${PORT}`);
-  });
+  app.listen(
+    PORT,
+    '0.0.0.0',
+    () => {
+      console.log(
+        `[FormVerify] Server running on http://0.0.0.0:${PORT}`
+      );
+    }
+  );
 }
 
 startServer();
