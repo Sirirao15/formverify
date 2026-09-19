@@ -1,0 +1,6 @@
+{
+  "name": "FormVerify – AI-Powered Application Form Verification System",
+  "description": "Multimodal application form extraction and automated two-stage self-verification system detecting OCR anomalies, missing fields, and contradictions with evidence grounded in the source document.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
